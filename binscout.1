@@ -1,0 +1,25 @@
+.TH man 1 "" "" "scout man page"
+.SH NAME
+scout \- Search in binary files.
+.SH SYNPOSIS
+scout [options] needle file
+.SH DESCRIPTION
+Search for a byte sequence in a binary file. Output the offset of each matching
+occurance in hex, one per line.
+.SH OPTIONS
+.TP
+\-h
+Display help.
+.TP
+\-t type
+How to interpret needle text:
+    hex              - Byte string in hexadecimal.
+    str              - ASCII string.
+    cstr             - ASCII string with including \0 byte terminator.
+    le16, le32, le64 - Little endian integers.
+    be16, be32, be64 - Big endian integers.
+
+.SH SEE ALSO
+strings(1)
+.SH AUTHOR
+Marc Butler <mockbutler@gmail.com>
