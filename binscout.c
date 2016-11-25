@@ -2,6 +2,9 @@
  * Copyright (c) 2010-2016 Marc Butler <mockbutler@gmail.com>
  *
  * Search a file for a byte sequence.
+ *
+ * Uses the Boyer Moore Horspool substring search algorithm for searching the
+ * file contents.
  */
 
 #define _BSD_SOURCE
@@ -9,6 +12,7 @@
 
 #include <assert.h>
 #include <ctype.h>
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,6 +48,7 @@ static unsigned char hex_table[] = {
 };
 #define HEXVAL(digit) (unsigned int)hex_table[(int)(digit)]
 
+/* Allocate zero filled heap memory. */
 void * xmalloc0(size_t sz)
 {
         void *p;
@@ -61,6 +66,9 @@ struct bytevec {
         unsigned char vec[];
 };
 
+/* Compile a hexadecimal string into a byte vector. If there is an odd number of
+ * hexadecimal digits. The first nybble is assumed to be zero.
+ */
 struct bytevec * compile_hex(const char *str, size_t len)
 {
         unsigned int binlen, ncnt;
@@ -87,11 +95,13 @@ struct bytevec * compile_hex(const char *str, size_t len)
         return bvec;
 }
 
+/* Endianness of integral value needles. */
 enum endian {
         ENDIAN_LITTLE,
         ENDIAN_BIG
 };
 
+/* Reverse bytes in memory. */
 void revmem(unsigned char *buf, size_t sz)
 {
         int b, e;
@@ -104,6 +114,7 @@ void revmem(unsigned char *buf, size_t sz)
         }
 }
 
+/* Decompose an integer into a byte vector. */
 struct bytevec * decompose_int(uint64_t val, size_t sz, enum endian en)
 {
         struct bytevec *bvec;
@@ -128,6 +139,7 @@ struct mmap_file {
         size_t size;
 };
 
+/* Memory map the contents of a file for reading only. */
 struct mmap_file * mmap_file_ro(const char *path)
 {
         int fd;
@@ -154,6 +166,7 @@ struct mmap_file * mmap_file_ro(const char *path)
         return pmmf;
 }
 
+/* Release a memory mapped file. */
 void mmap_file_close(struct mmap_file *mmf)
 {
         if (munmap(mmf->contents.raw, mmf->size) != 0)
@@ -161,79 +174,61 @@ void mmap_file_close(struct mmap_file *mmf)
         memset(mmf, 0, sizeof(*mmf));
 }
 
-void generate_jump_table(unsigned *jmptbl, struct bytevec *bv)
+bool memeq(void *p1, void *p2, size_t sz)
 {
+        assert(sz > 0);
+        if (sz == 0)
+                return true;
+        return (*(char *)p1 == *(char *)p2) && (memcmp(p1, p2, sz) == 0);
+}
+
+/* Generate a Boyer Moore Horspool compatible jump table. */
+unsigned int * bmh_gen_tbl(struct bytevec *bvec)
+{
+        unsigned *tbl;
         int i;
-        unsigned int j;
-
-        assert(jmptbl != NULL);
-        assert(bv != NULL);
-
+        assert(bvec != NULL && bvec->len > 0);
+        tbl = xmalloc0(sizeof(unsigned) * NUMBYTES);
         for (i = 0; i < NUMBYTES; i++)
-                jmptbl[i] = bv->len;
-
-        for (j = 0; j < bv->len; j++)
-                if (jmptbl[bv->vec[j]] == bv->len)
-                        jmptbl[(int)bv->vec[j]] = j + 1;
+                tbl[i] = bvec->len;
+        for (i = 0; i < bvec->len - 1; i++)
+                tbl[bvec->vec[i]] = bvec->len - 1 - i;
+        return tbl;
 }
 
-/* Calculate the largets byte sequence length in the tail that matches the head.
- *
- * That is: "abcxabc" would have an overlap of 3 ("abc"), and "aaa" would have
- * an overlap of 2 ("aa").
- *
- * This is used to allow overlapped sequences to be found.
- */
-size_t overlap(struct bytevec *bvec)
+/* Use Boyer Moore Horspool string search to look for the byte sequence. */
+void bmh_crawl(struct bytevec *bvec, struct mmap_file *mmf)
 {
-        int i;
-        size_t extent;
-        
-        assert(bvec != NULL);
-        if (bvec->len == 1)
-                return 0;
-
-        for (i = 1; i < bvec->len; i++) {
-                if (bvec->vec[0] == bvec->vec[i])
-                        if (memcmp(&bvec->vec[0], &bvec->vec[i], bvec->len - i) == 0)
-                                break;
-        }
-        extent = bvec->len - i;
-        assert(extent < bvec->len);
-        return (extent) ? extent : bvec->len;
-}
-
-void crawl(struct bytevec *bvec, struct mmap_file *mmf)
-{
-        static unsigned int jmptbl[NUMBYTES];
-        size_t off;
-        unsigned j;
         int rv;
-        int match_jump;
+        unsigned int *jmptbl;
+        size_t off;
+        unsigned char *haystack;
+        unsigned char *needle;
 
         assert(bvec->len > 0);
         assert(mmf->size > 0);
 
-        generate_jump_table(jmptbl, bvec);
-        match_jump = bvec->len = overlap(bvec);
+        jmptbl = bmh_gen_tbl(bvec);
 
         rv = madvise(mmf->contents.raw, mmf->size, MADV_SEQUENTIAL);
         if (rv != 0)
-                warn("madvise() failed: ");
-        off = bvec->len;
-        while (off < mmf->size) {
-                for (j = 0; j < bvec->len; j++) {
-                        if (bvec->vec[j] != mmf->contents.uc[(off - bvec->len) + j]) {
-                                off += jmptbl[bvec->vec[j]];
+                warn("madvise() failed");
+
+        haystack = mmf->contents.uc;
+        needle = bvec->vec;
+        off = 0;
+        while (mmf->size - off >= bvec->len) {
+                size_t i = bvec->len - 1;
+                while (haystack[off + i] == needle[i]) {
+                        if (i == 0) {
+                                printf("%8lx\n", off);
                                 break;
                         }
+                        i -= 1;
                 }
-                if (j == bvec->len) {
-                        printf("%8lx\n", (unsigned long)(off - bvec->len));
-                        /* Assume matches cannot overlap. */
-                        off += match_jump;
-                }
+                off = off + jmptbl[haystack[off + bvec->len - 1]];
         }
+        free(jmptbl);
 }
 
 enum needle_t {
@@ -365,7 +360,7 @@ int main(int argc, char **argv)
                 errx(1, "Unable to parse hex '%s'", argv[optind]);
         mmf = mmap_file_ro(argv[optind + 1]);
 
-        crawl(bvec, mmf);
+        bmh_crawl(bvec, mmf);
 
         mmap_file_close(mmf);
         free(mmf);
